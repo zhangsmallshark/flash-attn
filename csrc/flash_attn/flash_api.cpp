@@ -246,6 +246,54 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
 }
 
 std::vector<at::Tensor>
+parallel_attention_fwd(
+    torch::Tensor hidden_states,
+    torch::Tensor q_k_v_weights,
+    int num_attention_heads_per_partition,
+    int hidden_size_per_attention_head, 
+    torch::Tensor mlp_weights,
+)
+{
+    // Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+    torch::Tensor mixed_x = torch::matmul(hidden_states, q_k_v_weights.transpose())
+
+    // [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+    auto new_tensor_shape = mixed_x_layer.size()[:-1];
+    auto new_tensor_shape.push_back(num_attention_heads_per_partition);
+    auto new_tensor_shape.push_back(3 * self.hidden_size_per_attention_head);
+    torch::Tensor mixed_x1 = mixed_x.reshape(new_tensor_shape)
+
+    // [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+    auto query_key_value = torch::split(mixed_x1, 3, 3);
+    torch::Tensor query = query_key_value[0];
+    torch::Tensor key = query_key_value[1];
+    torch::Tensor value = query_key_value[2];
+
+    auto query_shape = query.size();
+    auto key_shape = key.size();
+
+    int batch_size = query_shape[0];
+    int seqlen_q = query_shape[1];
+    int seqlen_k = key_shape[1];
+
+    auto cu_seqlens_q = torch::arange(0, (batch_size + 1) * seqlen_q, seqlen_q);
+    auto cu_seqlens_k = cu_seqlens_q;
+    bool is_causal = True;
+    float dropout_p = 0.1;
+    float softmax_scale = 0.1;
+
+    auto flash_out = mha_fwd(
+        query, key, value, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+        dropout_p, softmax_scale, is_causal
+    );
+
+    // Output. [sq, b, h]
+    torch::Tensor out = torch::matmul(flash_out[0], mlp_weights.transpose());
+    return out;
+}
+
+
+std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x head_size
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
