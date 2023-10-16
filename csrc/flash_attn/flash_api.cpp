@@ -443,48 +443,53 @@ parallel_attention_fwd(
     torch::Tensor q_k_v_weights,
     int num_attention_heads_per_partition,
     int hidden_size_per_attention_head, 
-    torch::Tensor mlp_weights)
+
+    c10::optional<at::Tensor> &out_,  // batch_size x seqlen_q x num_heads x head_size
+    const float dropout_p,
+    const float softmax_scale,
+    bool is_causal,
+    const int window_size_left,
+    int window_size_right,
+    const bool return_softmax,
+    c10::optional<at::Generator> gen_,
+
+    torch::Tensor dense_weights)
 {
-    // Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+    // Attention heads [b, sq, h] --> [b, sq, (np * 3 * hn)]
     torch::Tensor mixed_x0 = torch::matmul(hidden_states, torch::transpose(q_k_v_weights, 0, 1));
 
-    // [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+    // [b, sq, (np * 3 * hn)] --> [b, sq, np, 3 * hn]
     auto x_shape0 = mixed_x0.sizes();
     std::vector<decltype(x_shape0)::value_type> x_shape1(x_shape0.begin(), x_shape0.end()-1);
     x_shape1.push_back(num_attention_heads_per_partition);
     x_shape1.push_back(3 * hidden_size_per_attention_head);
     torch::Tensor mixed_x1 = mixed_x0.reshape(x_shape1);
 
-    // [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-    auto q_k_v = torch::split(mixed_x1, 3, 3);
+    // [b, sq, np, 3 * hn] --> 3 [b, sq, np, hn]
+    auto q_k_v = torch::split(mixed_x1, hidden_size_per_attention_head, 3);
     torch::Tensor q = q_k_v[0];
     torch::Tensor k = q_k_v[1];
     torch::Tensor v = q_k_v[2];
 
-    // 's b ... -> b s ...'
-    q = torch::permute(q, {1, 0, 2, 3});
-    k = torch::permute(k, {1, 0, 2, 3});
-    v = torch::permute(v, {1, 0, 2, 3});
+    // int batch_size = q.sizes()[0];
+    // int seq_len_q = q.sizes()[1];
+    // int seq_len_k = k.sizes()[1];
+    // auto cu_seq_lens_q = torch::arange(0, (batch_size + 1) * seq_len_q, seq_len_q);
+    // auto cu_seq_lens_k = cu_seq_lens_q;
+    auto attn_outs = mha_fwd(q, k, v, out_, dropout_p, softmax_scale, is_causal, window_size_left, window_size_right, return_softmax, gen_);
 
-    int batch_size = q.sizes()[0];
-    int seq_len_q = q.sizes()[1];
-    int seq_len_k = k.sizes()[1];
-    auto cu_seq_lens_q = torch::arange(0, (batch_size + 1) * seq_len_q, seq_len_q);
-    auto cu_seq_lens_k = cu_seq_lens_q;
-    bool is_causal = true;
-    float dropout_p = 0.1;
-    float softmax_scale = 0.1;
-    auto attn_outs = mha_fwd(
-        q, k, v, cu_seq_lens_q, cu_seq_lens_k, seq_len_q, seq_len_k,
-        dropout_p, softmax_scale, is_causal);
     torch::Tensor attn_out = attn_outs[0];
-    // 'b s h d -> s b (h d)'
-    attn_out = torch::permute(attn_out, {1, 0, 2, 3});
+    // 'b s h d -> b s (h d)'
+    attn_out = torch::flatten(attn_out, 2, 3);
+    attn_out.contiguous();
 
-    // Output [sq, b, h]
-    torch::Tensor output = torch::matmul(attn_out, mlp_weights.transpose());
-    return {output};
+    // dense_out [b, sq, h]
+    torch::Tensor dense_out = torch::matmul(attn_out, torch::transpose(dense_weights, 0, 1));
+
+    attn_outs.push_back(dense_out);
+    return attn_outs;
 }
+
 
 std::vector<at::Tensor>
 mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -873,21 +878,16 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     return { dq, dk, dv, softmax_d };
 }
 
-    // Output [sq, b, h]
-    torch::Tensor output = torch::matmul(attn_out, mlp_weights.transpose());
-    return {output};
-
-
 std::vector<at::Tensor>
 parallel_attention_bwd(
     torch::Tensor grad_output,
     torch::Tensor attn_out,
-    torch::Tensor mlp_weights,
+    torch::Tensor dense_weights,
 
     const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
     const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
-    // const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
+    const at::Tensor &out_padded,   // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &softmax_lse,     // b x h x seqlen_q
     c10::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
     c10::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
@@ -902,37 +902,34 @@ parallel_attention_bwd(
 
     torch::Tensor hidden_states,
     torch::Tensor q_k_v_weights)
-
 {
-    torch::Tensor grad_attn_out = torch::matmul(grad_output, mlp_weights);
-    torch::Tensor grad_mlp_weights = torch::matmul(torch::transpose(grad_output, 0, 1), attn_out);
+    torch::Tensor grad_attn_out = torch::matmul(grad_output, dense_weights);
+    torch::Tensor grad_dense_weights = torch::matmul(torch::transpose(grad_output, 0, 1), attn_out);
 
-    // 's b (h d) -> b s h d'
-    grad_attn_out = torch::permute(grad_attn_out, {1, 0, 2, 3});
-
-    auto grads_attn = mha_bwd(grad_attn_out, q, k, v, attn_out, softmax_lse, dq_, dk_, dv_, p_dropout, 
+    // torch::Tensor dq_ = torch::empty_like(q);
+    // torch::Tensor dk_ = torch::empty_like(k);
+    // torch::Tensor dv_ = torch::empty_like(v);
+    auto grads_attn = mha_bwd(grad_attn_out, q, k, v, out_padded, softmax_lse, dq_, dk_, dv_, p_dropout, 
        softmax_scale, is_causal, window_size_left, window_size_right, gen_, rng_state);
+    // dq = dq[..., : grad_attn_out.shape[-1]]  # We could have padded the head dimension
+    // dk = dk[..., : grad_attn_out.shape[-1]]
+    // dv = dv[..., : grad_attn_out.shape[-1]]
 
     torch::Tensor grad_q = grads_attn[0];
     torch::Tensor grad_k = grads_attn[1];
     torch::Tensor grad_v = grads_attn[2];
     torch::Tensor grad_softmax = grads_attn[3];
   
-    // 'b s ... -> s b ...'
-    grad_q = torch::permute(grad_q, {1, 0, 2, 3});
-    grad_k = torch::permute(grad_k, {1, 0, 2, 3});
-    grad_v = torch::permute(grad_v, {1, 0, 2, 3});
-
-    // 3 [sq, b, np, hn] -> [sq, b, np, 3 * hn]
+    // 3 [b, sq, np, hn] -> [b, sq, np, 3 * hn]
     torch::Tensor grad_mixed_x1 = torch::cat({grad_q, grad_k, grad_v}, 3);
 
-    // [sq, b, np, 3 * hn] -> [sq, b, (np * 3 * hn)] 
-    torch::Tensor grad_mixed_x0 = torch::flatten(grad_mixed_x1, 2, 3)
+    // [b, sq, np, 3 * hn] -> [b, sq, (np * 3 * hn)] 
+    torch::Tensor grad_mixed_x0 = torch::flatten(grad_mixed_x1, 2, 3);
 
     torch::Tensor grad_hidden_states = torch::matmul(grad_mixed_x0, q_k_v_weights);
     torch::Tensor grad_q_k_v_weights = torch::matmul(torch::transpose(grad_mixed_x0, 0, 1), hidden_states);
 
-    return {grad_attn_out, grad_mlp_weights};
+    return {grad_hidden_states, grad_q_k_v_weights, grad_dense_weights};
 }
 
 std::vector<at::Tensor>
@@ -1406,8 +1403,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
+    m.def("parallel_attention_fwd", &parallel_attention_fwd, "Parallel forward pass");
     m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
     m.def("bwd", &mha_bwd, "Backward pass");
+    m.def("parallel_attention_bwd", &parallel_attention_bwd, "Parallel backward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }

@@ -3,6 +3,8 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 
+import math
+
 # isort: off
 # We need to import the CUDA kernels after importing torch
 import flash_attn_2_cuda as flash_attn_cuda
@@ -58,6 +60,108 @@ def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, 
         None,
     )
     return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+
+
+class ParallelAttentionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states, q_k_v_weights, num_attention_heads_per_partition, hidden_size_per_attention_head, 
+            dropout_p, softmax_scale, causal, window_size, return_softmax, dense_weights):
+
+        return_softmax = return_softmax and dropout_p > 0
+
+        attn_out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state, dense_out = flash_attn_cuda.parallel_attention_fwd(
+            hidden_states,
+            q_k_v_weights, 
+            num_attention_heads_per_partition, 
+            hidden_size_per_attention_head,
+            None,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size[0],
+            window_size[1],
+            return_softmax,
+            None,
+            dense_weights
+        )
+
+        ctx.save_for_backward(hidden_states, q_k_v_weights, attn_out, q, k, v, out_padded, softmax_lse, rng_state, dense_weights)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+
+        return dense_out
+
+    @staticmethod
+    def backward(ctx, grad_dense_out, *args):
+        hidden_states, q_k_v_weights, attn_out, q, k, v, out_padded, softmax_lse, rng_state, dense_weights = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        grad_attn_out, grad_q_k_v_weights, grad_dense_weights = flash_attn_cuda.parallel_attention_bwd(
+            grad_dense_out,
+            attn_out,
+            dense_weights,
+            q,
+            k,
+            v,
+            out_padded,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size[0],
+            ctx.window_size[1],
+            rng_state,
+            hidden_states,
+            q_k_v_weights,
+        )
+
+        return grad_attn_out, grad_dense_weights, grad_dense_weights
+
+
+class ParallelAttention1(nn.Module):
+    def __init__(self, hidden_size, num_attention_heads, tensor_model_parallel_world_size=1, en_q_k_v_bias=False, 
+            attention_dropout=0.0, softmax_scale=None, causal=False, 
+            window_size=(-1, -1), # -1 means infinite context window
+            return_softmax = False):
+        super(ParallelAttention1, self).__init__()
+
+        self.num_attention_heads_per_partition = num_attention_heads // tensor_model_parallel_world_size
+        self.hidden_size_per_attention_head = hidden_size // num_attention_heads
+
+        # [b, sq, h] --> [b, sq, (np * 3 * hn)]
+        self.q_k_v_weights = nn.Parameter(
+            torch.Tensor(self.num_attention_heads_per_partition*3*self.hidden_size_per_attention_head, hidden_size))
+        self.q_k_v_bias = nn.Parameter(torch.Tensor(1, self.num_attention_heads_per_partition*3*self.hidden_size_per_attention_head))
+
+        self.dropout_p = attention_dropout
+        if softmax_scale is None:
+            self.softmax_scale = self.hidden_size_per_attention_head ** (-0.5)
+        else:
+            self.softmax_scale = softmax_scale
+    
+        self.causal = causal
+        self.window_size = window_size
+        self.return_softmax = return_softmax
+
+        # [b s h d] -> [b, sq, h]
+        self.dense_weights = nn.Parameter(
+            torch.Tensor(hidden_size, self.num_attention_heads_per_partition*self.hidden_size_per_attention_head))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, +stdv)
+
+    def forward(self, hidden_states):
+        return ParallelAttentionFunction.apply(hidden_states, self.q_k_v_weights, self.num_attention_heads_per_partition, 
+            self.hidden_size_per_attention_head, self.dropout_p, self.softmax_scale, self.causal, self.window_size, self.return_softmax, 
+            self.dense_weights)
 
 
 def _flash_attn_varlen_forward(
