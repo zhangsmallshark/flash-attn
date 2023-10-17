@@ -97,7 +97,8 @@ class ParallelAttentionFunction(torch.autograd.Function):
     def backward(ctx, grad_dense_out, *args):
         hidden_states, q_k_v_weights, attn_out, q, k, v, out_padded, softmax_lse, rng_state, dense_weights = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        grad_attn_out, grad_q_k_v_weights, grad_dense_weights = flash_attn_cuda.parallel_attention_bwd(
+
+        grad_hidden_states, grad_q_k_v_weights, grad_dense_weights = flash_attn_cuda.parallel_attention_bwd(
             grad_dense_out,
             attn_out,
             dense_weights,
@@ -114,12 +115,13 @@ class ParallelAttentionFunction(torch.autograd.Function):
             ctx.causal,
             ctx.window_size[0],
             ctx.window_size[1],
+            None,
             rng_state,
             hidden_states,
             q_k_v_weights,
         )
 
-        return grad_attn_out, grad_dense_weights, grad_dense_weights
+        return grad_hidden_states, grad_q_k_v_weights, None, None, None, None, None, None, None, grad_dense_weights
 
 
 class ParallelAttention1(nn.Module):

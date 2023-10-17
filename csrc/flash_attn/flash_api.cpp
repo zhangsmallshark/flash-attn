@@ -903,8 +903,14 @@ parallel_attention_bwd(
     torch::Tensor hidden_states,
     torch::Tensor q_k_v_weights)
 {
+    auto attn_shape = attn_out.sizes();
     torch::Tensor grad_attn_out = torch::matmul(grad_output, dense_weights);
-    torch::Tensor grad_dense_weights = torch::matmul(torch::transpose(grad_output, 0, 1), attn_out);
+    grad_attn_out = torch::reshape(grad_attn_out, attn_shape);
+
+    // 'b s h d -> b s (h d)'
+    attn_out = torch::flatten(attn_out, 2, 3);
+    attn_out.contiguous();
+    torch::Tensor grad_dense_weights = torch::matmul(torch::transpose(grad_output, 1, 2), attn_out);
 
     // torch::Tensor dq_ = torch::empty_like(q);
     // torch::Tensor dk_ = torch::empty_like(k);
@@ -927,7 +933,7 @@ parallel_attention_bwd(
     torch::Tensor grad_mixed_x0 = torch::flatten(grad_mixed_x1, 2, 3);
 
     torch::Tensor grad_hidden_states = torch::matmul(grad_mixed_x0, q_k_v_weights);
-    torch::Tensor grad_q_k_v_weights = torch::matmul(torch::transpose(grad_mixed_x0, 0, 1), hidden_states);
+    torch::Tensor grad_q_k_v_weights = torch::matmul(torch::transpose(grad_mixed_x0, 1, 2), hidden_states);
 
     return {grad_hidden_states, grad_q_k_v_weights, grad_dense_weights};
 }
